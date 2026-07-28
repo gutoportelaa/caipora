@@ -1,4 +1,4 @@
-# 🪽 Hermes: Assistente Pessoal Local em Android Reproveitado
+# 🔥Caipora: Assistente Pessoal Local em Android Reproveitado
 
 ![Licença](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10+-yellow.svg)
