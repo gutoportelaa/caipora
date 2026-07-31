@@ -1,3 +1,26 @@
+# === Segredos — NUNCA commitar ===
+.env
+*.token
+token.json
+credentials.json
+# O Google baixa as credenciais com este nome por padrão. Sem esta linha,
+# um `git add .` distraído publica o client_secret.
+client_secret*.json
+*.apps.googleusercontent.com.json
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# === Modelos GGUF (gigabytes) ===
+models/
+*.gguf
+
+# === Dados pessoais (agenda, históricos) ===
+dados/
+
 # Gradle files
 .gradle/
 build/

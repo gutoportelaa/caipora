@@ -1,0 +1,28 @@
+# Gramática GBNF para extração de evento de agenda.
+#
+# Por que gramática em vez de pedir JSON no prompt:
+# a decodificação restrita torna saída malformada ESTRUTURALMENTE IMPOSSÍVEL.
+# O amostrador só pode escolher entre tokens que a gramática permite naquele
+# ponto. Não existe "esqueceu uma vírgula" nem "veio embrulhado em ```json" —
+# não há caminho no autômato que produza isso. É o que torna um modelo de
+# 1,7 B utilizável como extrator.
+#
+# ATENÇÃO — restrição verificada empiricamente neste build (llama.cpp 3018a11):
+# CADA REGRA PRECISA CABER EM UMA ÚNICA LINHA. Continuação de linha começando
+# com "|" faz o parser falhar com "failed to parse grammar", mesmo sendo a
+# forma que a documentação do GBNF sugere. Daí as linhas longas abaixo.
+#
+# Divisão de trabalho: a gramática restringe FORMA, não SEMÂNTICA. Ela garante
+# "hora sintaticamente válida 00:00–23:59", não que seja a hora que o usuário
+# quis. E de propósito NÃO pedimos data absoluta ao modelo — modelos pequenos
+# erram aritmética de calendário. O modelo devolve a referência relativa
+# ("amanha", "sexta") e o Python resolve contra o relógio real.
+
+root ::= "{\"titulo\":\"" titulo "\",\"data\":\"" data "\",\"hora\":\"" hora "\",\"duracao_min\":" duracao "}"
+titulo ::= [^"\\{}\n\r\t]+
+data ::= relativa | iso
+relativa ::= "hoje" | "amanha" | "depois-de-amanha" | "segunda" | "terca" | "quarta" | "quinta" | "sexta" | "sabado" | "domingo"
+iso ::= dig dig dig dig "-" dig dig "-" dig dig
+hora ::= ("0" dig | "1" dig | "2" [0-3]) ":" [0-5] dig
+duracao ::= [1-9] | [1-9] dig | [1-9] dig dig
+dig ::= [0-9]
