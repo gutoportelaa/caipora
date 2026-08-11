@@ -36,6 +36,33 @@ DIAS_SEMANA = {
     "domingo": 6,
 }
 
+# Formas curtas e coloquiais, para "seg, qua e sex". Mapeadas à parte porque
+# "sab"/"dom" não são prefixo das formas longas com -feira.
+DIAS_SEMANA_CURTO = {
+    "seg": 0, "ter": 1, "qua": 2, "qui": 3, "sex": 4, "sab": 5, "dom": 6,
+}
+
+# Meses por nome. Sem isto, "dia 15 de março" caía no ramo genérico "dia 15"
+# e virava 15 do mês CORRENTE — data errada, sem nenhum aviso ao usuário.
+MESES = {
+    "janeiro": 1, "jan": 1,
+    "fevereiro": 2, "fev": 2,
+    "marco": 3, "mar": 3,
+    "abril": 4, "abr": 4,
+    "maio": 5, "mai": 5,
+    "junho": 6, "jun": 6,
+    "julho": 7, "jul": 7,
+    "agosto": 8, "ago": 8,
+    "setembro": 9, "set": 9,
+    "outubro": 10, "out": 10,
+    "novembro": 11, "nov": 11,
+    "dezembro": 12, "dez": 12,
+}
+
+# Alternância ordenada da mais longa para a mais curta: sem isso "mar" casaria
+# antes de "marco" e sobraria "co" no título.
+_ALT_MESES = "|".join(sorted(MESES, key=len, reverse=True))
+
 
 @dataclass(frozen=True)
 class Quando:
@@ -47,6 +74,28 @@ class Quando:
     @property
     def fim(self) -> datetime:
         return self.inicio + timedelta(minutes=self.duracao_min)
+
+
+@dataclass(frozen=True)
+class Recorrencia:
+    """Recorrência extraída da frase.
+
+    Devolver um objeto em vez de uma tupla de três (freq, ancora, resto) ficou
+    inevitável quando entraram dias múltiplos e intervalo: uma tupla de cinco
+    posições no ponto de chamada é ilegível e fácil de trocar de ordem.
+
+    `freq` é a string do enum Freq — devolver string evita import circular com
+    dominio.py, que importa daqui.
+    """
+
+    freq: str = "unica"
+    ancora: int | None = None           # MENSAL: dia do mês
+    dias_semana: tuple[int, ...] = ()   # SEMANAL: 0=segunda
+    intervalo: int = 1                  # quinzenal = semanal com intervalo 2
+
+    @property
+    def eh_unica(self) -> bool:
+        return self.freq == "unica"
 
 
 # Horas convencionais para períodos do dia sem hora explícita.
@@ -133,6 +182,27 @@ def extrair_data(texto: str, agora: datetime) -> tuple[date | None, str]:
     if m:
         return hoje, _remover(texto, m.span())
 
+    # "15 de marco", "dia 5 de setembro", "20 de dezembro de 2027"
+    #
+    # Precisa vir ANTES do ramo genérico "dia N": lá embaixo, "dia 15 de
+    # marco" casava só o "dia 15" e agendava no mês corrente, deixando
+    # "de marco" no título. Errava a data em silêncio, que é o pior tipo de
+    # erro para uma agenda.
+    m = re.search(
+        rf"\b(?:dia\s+)?(\d{{1,2}})\s+de\s+({_ALT_MESES})\b(?:\s+de\s+(\d{{4}}))?", t
+    )
+    if m:
+        mes = MESES[m[2]]
+        ano = int(m[3]) if m[3] else hoje.year
+        try:
+            d = date(ano, mes, int(m[1]))
+            # Sem ano explícito e data já passada => assume ano que vem.
+            if not m[3] and d < hoje:
+                d = date(ano + 1, mes, int(m[1]))
+            return d, _remover(texto, m.span())
+        except ValueError:
+            pass
+
     # dia da semana, com ou sem "que vem"/"proxima"
     for nome, idx in DIAS_SEMANA.items():
         m = re.search(
@@ -175,6 +245,29 @@ def extrair_hora(texto: str, referencia_periodo: str | None = None) -> tuple[tim
 
     periodo = referencia_periodo
 
+    # "8 e meia", "8h e quinze", "14 e 30" — forma falada, comum em lembrete
+    # ditado às pressas. Precisa vir ANTES do padrão numérico principal,
+    # senão "8h e meia" casa só o "8h" e o "e meia" sobra no título.
+    #
+    # Minutos por extenso ficam restritos a "meia"/"quinze" e a dois dígitos
+    # de propósito: aceitar um dígito faria "3 e 4 pessoas" virar 03:04.
+    m = re.search(
+        r"\b(\d{1,2})\s*(?:h|hs|horas?)?\s+e\s+(meia|quinze|\d{2})\s*(?:min|minutos?)?\b", t
+    )
+    if m:
+        minuto = {"meia": 30, "quinze": 15}.get(m[2], 0) or int(m[2] if m[2].isdigit() else 0)
+        hora, fim = int(m[1]), m.end()
+        if hora <= 23 and minuto <= 59:
+            mp = re.compile(r"\s*(?:da|de)\s+(manha|tarde|noite)\b").match(t, fim)
+            if mp:
+                periodo = "am" if mp[1] == "manha" else "pm"
+                fim = mp.end()
+            if periodo == "pm" and hora < 12:
+                hora += 12
+            elif periodo == "am" and hora == 12:
+                hora = 0
+            return time(hora, minuto), _remover(texto, (m.start(), fim))
+
     # 15:45 | 15h45 | 15h | 15 horas
     m = re.search(r"\b(\d{1,2})\s*(?::|h|hs|horas?)\s*(\d{2})?\b", t)
     if m:
@@ -204,6 +297,52 @@ def extrair_hora(texto: str, referencia_periodo: str | None = None) -> tuple[tim
         hora = 0
 
     return time(hora, minuto), _remover(texto, (m.start(), fim))
+
+
+# ----------------------------------------------------------------- intervalo
+
+
+# "das 14h às 16h", "de 7h as 8h", "19h30-22h", "das 7 as 8 da manha".
+#
+# É a forma natural de descrever HORÁRIO RESERVADO — ninguém diz "academia às
+# 7h com 60 minutos de duração", diz "academia das 7 às 8". Antes disto o
+# parser pegava só o "14h", assumia 60 min e ainda deixava "as 16h" no título.
+_INTERVALO = re.compile(
+    r"\bd[ae]s?\s+(\d{1,2})(?:[:h](\d{2}))?\s*(?:h|hs|horas?)?"
+    r"\s*(?:as|a|ate|-|–|—)\s*"
+    r"(\d{1,2})(?:[:h](\d{2}))?\s*(?:h|hs|horas?)?"
+    r"(?:\s*(?:da|de)\s+(manha|tarde|noite))?\b"
+)
+
+
+def extrair_intervalo(texto: str) -> tuple[time | None, int | None, str]:
+    """Faixa horária explícita. Devolve (início, duração_min, resto)."""
+    t = normalizar(texto)
+    m = _INTERVALO.search(t)
+    if not m:
+        return None, None, texto
+
+    h1, m1 = int(m[1]), int(m[2] or 0)
+    h2, m2 = int(m[3]), int(m[4] or 0)
+    if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59:
+        return None, None, texto
+
+    # "das 7 às 8 da noite" qualifica as DUAS pontas, não só a última.
+    if m[5] in ("tarde", "noite"):
+        h1 += 12 if h1 < 12 else 0
+        h2 += 12 if h2 < 12 else 0
+    elif m[5] == "manha":
+        h1 = 0 if h1 == 12 else h1
+        h2 = 0 if h2 == 12 else h2
+
+    inicio = time(h1 % 24, m1)
+    dur = (h2 % 24) * 60 + m2 - (h1 % 24) * 60 - m1
+    if dur <= 0:
+        # Atravessa a meia-noite ("das 22h às 2h"). Raro, mas somar 24h é
+        # mais honesto que devolver duração negativa.
+        dur += 24 * 60
+
+    return inicio, dur, _remover(texto, m.span())
 
 
 # ------------------------------------------------------------------ duração
@@ -249,6 +388,9 @@ def _remover(texto: str, span: tuple[int, int]) -> str:
 VERBOS_LIXO = re.compile(
     r"^\s*(?:me\s+)?(?:marca(?:r)?|agenda(?:r)?|cria(?:r)?|coloca(?:r)?|bota(?:r)?|"
     r"lembra(?:r)?(?:\s+de|\s+da|\s+do)?|avisa(?:r)?(?:\s+de)?|anota(?:r)?|"
+    # "não esquecer de mandar mensagem" -> "Mandar mensagem". A negação é
+    # instrução ao assistente, não parte da tarefa.
+    r"n[aã]o\s+(?:me\s+)?(?:deix[ae]\s+)?esquec(?:er|a|e)(?:\s+de|\s+da|\s+do)?|"
     r"adiciona(?:r)?|paga(?:r|mento)?(?:\s+de|\s+da|\s+do)?)\s+",
     re.IGNORECASE,
 )
@@ -281,17 +423,64 @@ def limpar_titulo(resto: str) -> str:
 # --------------------------------------------------------------- recorrência
 
 
-def extrair_recorrencia(texto: str) -> tuple[str, int | None, str]:
-    """Detecta recorrência. Devolve (freq, ancora, texto_restante).
+# Alternância de dias da semana, longas antes das curtas para que "segunda"
+# não seja truncada em "seg". O lookahead final evita casar "seg" dentro de
+# outra palavra.
+_ALT_DIAS = "|".join(
+    sorted(list(DIAS_SEMANA) + list(DIAS_SEMANA_CURTO), key=len, reverse=True)
+)
+_DIA = rf"(?:{_ALT_DIAS})s?(?:-feiras?|feiras?)?(?![a-z])"
 
-    freq é a string do enum Freq ("unica", "mensal", ...). Devolver string
-    evita import circular com dominio.py, que importa daqui.
+# Lista de dias exigindo o marcador "todo/toda": "toda terça e quinta",
+# "todas as segundas, quartas e sextas".
+#
+# Exigir "tod*" é deliberado. Sem isso, "reunião segunda e terça" — que quase
+# sempre significa duas datas pontuais — viraria uma recorrência semanal
+# permanente. Errar para o lado de NÃO criar recorrência é o lado barato.
+_LISTA_DIAS = re.compile(
+    rf"\btod(?:a|as|o|os)\s+(?:as\s+|os\s+)?{_DIA}"
+    rf"(?:\s*(?:,|e)\s*(?:as\s+|os\s+)?{_DIA})*"
+)
+
+# "de segunda a sexta", "de seg a sab"
+_FAIXA_DIAS = re.compile(rf"\bd[ae]\s+({_DIA})\s+(?:a|ate)\s+({_DIA})\b")
+
+_ACHA_DIA = re.compile(_DIA)
+
+
+def _indice_dia(token: str) -> int | None:
+    token = re.sub(r"(-feiras?|feiras?)$", "", token)
+    if token in DIAS_SEMANA:
+        return DIAS_SEMANA[token]
+    if token.endswith("s") and token[:-1] in DIAS_SEMANA:
+        return DIAS_SEMANA[token[:-1]]
+    if token in DIAS_SEMANA_CURTO:
+        return DIAS_SEMANA_CURTO[token]
+    if token.endswith("s") and token[:-1] in DIAS_SEMANA_CURTO:
+        return DIAS_SEMANA_CURTO[token[:-1]]
+    return None
+
+
+def _dias_do_trecho(trecho: str) -> tuple[int, ...]:
+    achados = []
+    for m in _ACHA_DIA.finditer(trecho):
+        idx = _indice_dia(m.group(0))
+        if idx is not None and idx not in achados:
+            achados.append(idx)
+    return tuple(sorted(achados))
+
+
+def extrair_recorrencia(texto: str) -> tuple[Recorrencia, str]:
+    """Detecta recorrência. Devolve (Recorrencia, texto_restante).
 
     Contas e pagamentos são recorrentes por natureza — "todo dia 5" é a forma
-    mais comum de expressar vencimento no Brasil.
+    mais comum de expressar vencimento no Brasil. Aulas e treinos também, e
+    quase sempre em VÁRIOS dias da semana ("de segunda a sexta"), por isso a
+    recorrência semanal carrega uma lista e não um dia só.
     """
     t = normalizar(texto)
 
+    # ------------------------------------------------------------- mensal
     # "todo dia 5", "todo mes dia 5", "dia 5 de todo mes"
     #
     # O lookahead separa dois sentidos que colidem:
@@ -304,41 +493,87 @@ def extrair_recorrencia(texto: str) -> tuple[str, int | None, str]:
         t,
     )
     if m:
-        return "mensal", int(m[1]), _remover(texto, m.span())
+        return Recorrencia("mensal", int(m[1])), _remover(texto, m.span())
     m = re.search(r"\bdia\s+(\d{1,2})\s+de\s+todo(?:s)?\s+(?:o\s+)?(?:mes|mês|meses)\b", t)
     if m:
-        return "mensal", int(m[1]), _remover(texto, m.span())
+        return Recorrencia("mensal", int(m[1])), _remover(texto, m.span())
+
+    # "a cada 3 meses", "a cada 2 semanas", "a cada 10 dias"
+    m = re.search(r"\ba\s+cada\s+(\d{1,2})\s*(dias?|semanas?|mes(?:es)?|anos?)\b", t)
+    if m:
+        n, unidade = max(1, int(m[1])), m[2]
+        if unidade.startswith("mes"):
+            return Recorrencia("mensal", None, (), n), _remover(texto, m.span())
+        if unidade.startswith("ano"):
+            return Recorrencia("anual", None, (), n), _remover(texto, m.span())
+        if unidade.startswith("semana"):
+            return Recorrencia("semanal", None, (), n), _remover(texto, m.span())
+        # "a cada 14/15 dias" é como se fala quinzenal no Brasil, e quinzenal
+        # preserva o dia da semana — "a cada 15 dias" contado em dias corridos
+        # faria a consulta de quarta cair numa quinta. Os demais N ficam em
+        # dias corridos mesmo, que é o sentido literal.
+        if n in (14, 15):
+            return Recorrencia("semanal", None, (), 2), _remover(texto, m.span())
+        return Recorrencia("diaria", None, (), n), _remover(texto, m.span())
+
+    # "quinzenal", "quinzenalmente", "de 15 em 15 dias"
+    m = re.search(r"\b(quinzenal(?:mente)?|de\s+15\s+em\s+15\s+dias)\b", t)
+    if m:
+        return Recorrencia("semanal", None, (), 2), _remover(texto, m.span())
 
     # "mensalmente", "todo mes", "por mes"
-    m = re.search(r"\b(mensalmente|todo\s+(?:o\s+)?mes|todo\s+(?:o\s+)?mês|por\s+mes|por\s+mês)\b", t)
+    m = re.search(r"\b(mensalmente|todo\s+(?:o\s+)?mes|por\s+mes)\b", t)
     if m:
-        return "mensal", None, _remover(texto, m.span())
+        return Recorrencia("mensal"), _remover(texto, m.span())
 
-    # "toda segunda", "todas as sextas"
-    for nome, idx in DIAS_SEMANA.items():
-        m = re.search(rf"\btod(?:a|as|o|os)\s+(?:as\s+|os\s+)?{nome}s?(?:-feira|feiras?)?\b", t)
-        if m:
-            return "semanal", idx, _remover(texto, m.span())
+    # ------------------------------------------------------------ semanal
+    # "todo dia util", "todos os dias uteis"
+    # "util" e "uteis" não compartilham prefixo útil para uma só alternativa.
+    m = re.search(r"\btod(?:o|os)\s+(?:os\s+)?dias?\s+ut(?:il|eis)\b", t)
+    if m:
+        return Recorrencia("semanal", None, (0, 1, 2, 3, 4)), _remover(texto, m.span())
+
+    # "todo fim de semana", "todos os fins de semana"
+    m = re.search(r"\btod(?:o|os)\s+(?:os\s+)?fi(?:m|ns)\s+de\s+semana\b", t)
+    if m:
+        return Recorrencia("semanal", None, (5, 6)), _remover(texto, m.span())
+
+    # "de segunda a sexta"
+    m = _FAIXA_DIAS.search(t)
+    if m:
+        ini, fim = _indice_dia(m[1]), _indice_dia(m[2])
+        if ini is not None and fim is not None:
+            # Faixa que dá a volta na semana ("de sexta a segunda") é rara mas
+            # legítima; o módulo evita o caso especial contando para frente.
+            passo = (fim - ini) % 7
+            dias = tuple(sorted((ini + i) % 7 for i in range(passo + 1)))
+            return Recorrencia("semanal", None, dias), _remover(texto, m.span())
+
+    # "toda segunda", "toda terça e quinta", "todas as segundas e quartas"
+    m = _LISTA_DIAS.search(t)
+    if m:
+        dias = _dias_do_trecho(m.group(0))
+        if dias:
+            return Recorrencia("semanal", None, dias), _remover(texto, m.span())
 
     # "semanalmente", "toda semana"
     m = re.search(r"\b(semanalmente|toda\s+(?:a\s+)?semana|por\s+semana)\b", t)
     if m:
-        return "semanal", None, _remover(texto, m.span())
+        return Recorrencia("semanal"), _remover(texto, m.span())
 
-    # "todo dia", "diariamente".
+    # ------------------------------------------------------- diária e anual
     # Chega aqui só o que o padrão mensal acima recusou — ou seja, "todo dia"
     # sem dia-do-mês, ou seguido de hora ("todo dia 8h"). Nesse segundo caso
     # consumimos apenas "todo dia" e deixamos a hora para extrair_hora.
     m = re.search(r"\b(diariamente|todo\s+dia)\b", t)
     if m:
-        return "diaria", None, _remover(texto, m.span())
+        return Recorrencia("diaria"), _remover(texto, m.span())
 
-    # "todo ano", "anualmente"
     m = re.search(r"\b(anualmente|todo\s+(?:o\s+)?ano)\b", t)
     if m:
-        return "anual", None, _remover(texto, m.span())
+        return Recorrencia("anual"), _remover(texto, m.span())
 
-    return "unica", None, texto
+    return Recorrencia(), texto
 
 
 # ------------------------------------------------------------------ relativo
@@ -352,12 +587,12 @@ def extrair_relativo(texto: str, agora: datetime) -> tuple[datetime | None, str]
     """
     t = normalizar(texto)
 
-    m = re.search(r"\b(?:em|daqui\s+a|dentro\s+de)\s+meia\s+hora\b", t)
+    m = re.search(r"\b(?:em|daqui(?:\s+a)?|dentro\s+de)\s+meia\s+hora\b", t)
     if m:
         return agora + timedelta(minutes=30), _remover(texto, m.span())
 
     m = re.search(
-        r"\b(?:em|daqui\s+a|dentro\s+de)\s+(?:uma?\s+|1\s+)?(\d+)?\s*"
+        r"\b(?:em|daqui(?:\s+a)?|dentro\s+de)\s+(?:uma?\s+|1\s+)?(\d+)?\s*"
         r"(minutos?|mins?|horas?|hs?|dias?|semanas?)\b",
         t,
     )
@@ -433,9 +668,18 @@ def interpretar(frase: str, agora: datetime | None = None) -> tuple[Quando | Non
     avisos: list[str] = []
 
     resto = frase
+    # A faixa ("das 7h às 8h") vem antes de duração e de hora porque entrega
+    # as duas de uma vez; deixá-la para depois faria `hora` levar só o início
+    # e o fim sobraria no título.
+    hora_faixa, dur_faixa, resto = extrair_intervalo(resto)
     duracao, resto = extrair_duracao(resto)
     data, resto = extrair_data(resto, agora)
     hora, resto = extrair_hora(resto)
+
+    if hora_faixa is not None:
+        hora = hora_faixa
+    if dur_faixa is not None:
+        duracao = dur_faixa
 
     titulo = limpar_titulo(resto)
 
