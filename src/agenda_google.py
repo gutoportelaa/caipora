@@ -27,7 +27,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from dominio import FUSO, Compromisso, Freq, Tipo
+from dominio import FUSO, Compromisso, Freq, Tipo, antecedencia_min
 
 log = logging.getLogger(__name__)
 
@@ -122,16 +122,22 @@ class AgendaGoogle:
 
     @staticmethod
     def _rrule(comp: Compromisso) -> list[str]:
-        """Traduz nossa recorrência para RRULE (RFC 5545)."""
+        """Traduz nossa recorrência para RRULE (RFC 5545).
+
+        `intervalo` vira INTERVAL: quinzenal é FREQ=WEEKLY;INTERVAL=2. A RFC
+        conta o intervalo a partir do DTSTART, que é exatamente a semântica
+        do backend local — os dois continuam concordando.
+        """
         if comp.freq is Freq.UNICA:
             return []
+        intervalo = f";INTERVAL={comp.intervalo}" if comp.intervalo > 1 else ""
         if comp.freq is Freq.DIARIA:
-            return ["RRULE:FREQ=DAILY"]
+            return [f"RRULE:FREQ=DAILY{intervalo}"]
         if comp.freq is Freq.SEMANAL:
-            dia = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")[
-                comp.ancora if comp.ancora is not None else comp.quando_dt.weekday()
-            ]
-            return [f"RRULE:FREQ=WEEKLY;BYDAY={dia}"]
+            nomes = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
+            dias = sorted(comp.dias_semana) or [comp.quando_dt.weekday()]
+            byday = ",".join(nomes[d] for d in dias)
+            return [f"RRULE:FREQ=WEEKLY;BYDAY={byday}{intervalo}"]
         if comp.freq is Freq.MENSAL:
             dia = comp.ancora or comp.quando_dt.day
             # BYMONTHDAY=31 sozinho PULA os meses sem dia 31 — o oposto do que
@@ -145,10 +151,10 @@ class AgendaGoogle:
             # Isso reproduz exatamente o min(dia, último_dia) do backend local,
             # mantendo os dois backends com o mesmo comportamento.
             if dia >= 29:
-                return [f"RRULE:FREQ=MONTHLY;BYMONTHDAY={dia},-1;BYSETPOS=1"]
-            return [f"RRULE:FREQ=MONTHLY;BYMONTHDAY={dia}"]
+                return [f"RRULE:FREQ=MONTHLY;BYMONTHDAY={dia},-1;BYSETPOS=1{intervalo}"]
+            return [f"RRULE:FREQ=MONTHLY;BYMONTHDAY={dia}{intervalo}"]
         if comp.freq is Freq.ANUAL:
-            return ["RRULE:FREQ=YEARLY"]
+            return [f"RRULE:FREQ=YEARLY{intervalo}"]
         return []
 
     def _para_evento(self, comp: Compromisso) -> dict:
@@ -166,7 +172,12 @@ class AgendaGoogle:
                 "caipora_freq": comp.freq.value,
                 "caipora_ancora": str(comp.ancora or ""),
                 "caipora_valor": str(comp.valor_centavos or ""),
-                "caipora_avisos": ",".join(str(d) for d in comp.avisos_dias),
+                # Avisos viajam como escritos ("-30m", "D0@07:30"): a mesma
+                # string que o domínio interpreta, sem conversão nem perda.
+                "caipora_avisos": ",".join(comp.avisos),
+                "caipora_dias": ",".join(str(d) for d in comp.dias_semana),
+                "caipora_intervalo": str(comp.intervalo),
+                "caipora_criado": comp.criado_em,
             }},
         }
 
@@ -177,11 +188,16 @@ class AgendaGoogle:
         if comp.tipo is Tipo.PAGAMENTO:
             partes = [f"Pagamento{': ' + comp.valor_fmt() if comp.valor_centavos else ''}"]
             ev["description"] = "\n".join(partes)
-            # Lembretes nativos do Google além do nosso Vigia: redundância
-            # barata e útil se o celular estiver fora do ar.
+
+        # Lembretes nativos do Google além do nosso Vigia: redundância barata
+        # e útil se o celular estiver fora do ar. O Google aceita no máximo 5
+        # por evento — que é exatamente quantos a escalada de reunião tem.
+        minutos = sorted(
+            {antecedencia_min(a, inicio) for a in comp.avisos}, reverse=True
+        )[:5]
+        if minutos:
             ev["reminders"] = {"useDefault": False, "overrides": [
-                {"method": "popup", "minutes": d * 24 * 60}
-                for d in comp.avisos_dias
+                {"method": "popup", "minutes": m} for m in minutos
             ]}
 
         return ev
@@ -198,18 +214,37 @@ class AgendaGoogle:
         def _int(v):
             return int(v) if v not in (None, "") else None
 
-        avisos = [int(x) for x in (priv.get("caipora_avisos") or "").split(",") if x]
+        tipo = Tipo(priv.get("caipora_tipo", "lembrete"))
+
+        # Duração vem do próprio evento, não de uma propriedade nossa: o
+        # usuário pode ter arrastado a borda do bloco no Google, e a agenda
+        # dele é a verdade. Reserva depende disso para mostrar "7:00–8:00".
+        duracao = None
+        fim = (ev.get("end") or {}).get("dateTime")
+        if fim and tipo in (Tipo.REUNIAO, Tipo.RESERVA):
+            try:
+                delta = datetime.fromisoformat(fim) - datetime.fromisoformat(inicio)
+                duracao = max(0, int(delta.total_seconds() // 60)) or None
+            except ValueError:
+                duracao = None
+
+        avisos = [a for a in (priv.get("caipora_avisos") or "").split(",") if a]
+        dias = [int(d) for d in (priv.get("caipora_dias") or "").split(",") if d]
+
         return Compromisso(
-            tipo=Tipo(priv.get("caipora_tipo", "lembrete")),
+            tipo=tipo,
             titulo=ev.get("summary", "(sem titulo)"),
             quando=inicio,
-            duracao_min=None,
+            duracao_min=duracao,
             valor_centavos=_int(priv.get("caipora_valor")),
             freq=Freq(priv.get("caipora_freq", "unica")),
             ancora=_int(priv.get("caipora_ancora")),
-            avisos_dias=avisos or [0],
+            dias_semana=dias,
+            intervalo=max(1, _int(priv.get("caipora_intervalo")) or 1),
+            avisos=avisos or ["0"],
             id=ev.get("id", ""),
             avisado_em=priv.get("caipora_avisado", ""),
+            criado_em=priv.get("caipora_criado", ""),
         )
 
     # -------------------------------------------------------------- interface
@@ -236,7 +271,7 @@ class AgendaGoogle:
 
         # A API só filtra por uma propriedade por vez; buscamos os outros tipos
         # em chamadas separadas e juntamos.
-        for tipo in ("reuniao", "lembrete"):
+        for tipo in ("reuniao", "reserva", "lembrete"):
             r = self._chamar("GET", f"/calendars/{self._cal}/events", params={
                 "timeMin": (agora - timedelta(days=1)).isoformat(),
                 "timeMax": (agora + timedelta(days=400)).isoformat(),

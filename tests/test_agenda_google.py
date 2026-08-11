@@ -96,7 +96,7 @@ def main() -> int:
     checa("volta: valor", volta.valor_centavos, 185000)
     checa("volta: freq", volta.freq, Freq.MENSAL)
     checa("volta: ancora", volta.ancora, 5)
-    checa("volta: avisos", volta.avisos_dias, [2, 0])
+    checa("volta: avisos", volta.avisos, ["-2d", "0"])
     checa("volta: id", volta.id, "abc123")
 
     # Evento de dia inteiro criado fora do Caipora deve ser ignorado, nao

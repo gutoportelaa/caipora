@@ -21,24 +21,44 @@ import subprocess
 from datetime import datetime, timedelta
 
 from analise import NaoEntendi, analisar
-from calendario import Agenda, proximos, total_a_pagar
-from dominio import FUSO, Compromisso, Tipo
+from calendario import Agenda, flutuantes, proximos, total_a_pagar
+from dominio import (
+    FUSO,
+    Compromisso,
+    Tipo,
+    antecedencia_min,
+    aviso_eh_ancora,
+    momento_do_aviso,
+)
 from llm import LLM, ErroLLM
 
 log = logging.getLogger(__name__)
 
 AJUDA = """Caipora — assistente local 🔥
 
-*Agendar* (basta escrever)
-  pagar aluguel todo dia 5, R$ 1.850
-  reunião com o time toda segunda 10h
+*Compromisso marcado* 👥 — avisa 07:30, 30/15/10 min antes e na hora
   dentista amanhã 14h
-  me lembra em 2 horas de ligar pro João
+  reunião com o time das 14h às 16h
+
+*Horário reservado* 📌 — rotina; avisa 07:30 e 30 min antes
+  academia de segunda a sexta das 7h às 8h
+  aula de inglês toda terça e quinta 19h30
+  psicólogo quinzenal quarta 15h
+
+*Conta a pagar* 💰 — avisa 2 dias antes e no dia
+  pagar aluguel todo dia 5, R$ 1.850
+  internet dia 12 de todo mês, 129,90
+
+*Lembrete* 🔔
+  me lembra em 2 horas de ligar pro João      (na hora marcada)
+  me lembra de estudar cálculo                (quando houver espaço)
 
 *Consultar*
   /agenda      próximos compromissos
   /contas      pagamentos e total do mês
   /hoje        só o dia de hoje
+  /lembretes   pendências sem hora marcada
+  /feito N     risca a pendência N
   /cancelar N  cancela o item N da /agenda
 
 *Sistema*
@@ -78,6 +98,37 @@ def _reais(centavos: int) -> str:
     return f"R$ {centavos / 100:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 
+def _resumo_avisos(comp: Compromisso) -> str:
+    """Lista legível dos avisos, para o usuário conferir ANTES de confirmar.
+
+    Mostrar isto na confirmação não é enfeite: a diferença entre "compromisso
+    marcado" e "horário reservado" é justamente quantos avisos você vai
+    receber, e essa é a hora de discordar da escolha do classificador.
+    """
+    if comp.eh_flutuante:
+        return "🔔 quando houver espaço no dia"
+    if not comp.avisos:
+        return ""
+
+    oc = comp.quando_dt
+    partes: list[str] = []
+    for aviso in comp.avisos:
+        if aviso_eh_ancora(aviso):
+            momento = momento_do_aviso(aviso, oc)
+            partes.append(f"{momento:%H:%M}" if momento else aviso)
+            continue
+        mins = antecedencia_min(aviso, oc)
+        if mins == 0:
+            partes.append("na hora")
+        elif mins % 1440 == 0:
+            partes.append(f"{mins // 1440}d antes")
+        elif mins % 60 == 0:
+            partes.append(f"{mins // 60}h antes")
+        else:
+            partes.append(f"{mins}min antes")
+    return "🔔 " + ", ".join(partes)
+
+
 class Roteador:
     def __init__(self, llm: LLM, agenda: Agenda, relogio=None):
         self._llm = llm
@@ -95,16 +146,33 @@ class Roteador:
         # que o usuário viu. Recalcular a lista no cancelamento poderia
         # cancelar outro item se algo mudou no meio.
         self._ultima_lista: dict[str, list[Compromisso]] = {}
+        # Lista separada para as pendências sem hora: elas não aparecem na
+        # /agenda, então numerá-las junto faria /feito 2 e /cancelar 2
+        # apontarem para coisas diferentes com a mesma cara.
+        self._ultima_lista_flut: dict[str, list[Compromisso]] = {}
 
     # ---------------------------------------------------------------- consultas
 
     def _listar(self, remetente: str, dias: int = 60, titulo: str = "Próximos") -> str:
         pares = proximos(self._agenda, agora=self._agora(), dias=dias)
-        if not pares:
+        soltos = flutuantes(self._agenda)
+
+        if not pares and not soltos:
             return "Nada agendado."
+
         self._ultima_lista[remetente] = [c for c, _ in pares]
         linhas = [f"{i}. {c.humano(oc)}" for i, (c, oc) in enumerate(pares, 1)]
-        return f"📅 *{titulo}*\n" + "\n".join(linhas)
+        saida = f"📅 *{titulo}*\n" + "\n".join(linhas) if pares else "Nada agendado."
+
+        # As pendências soltas vêm depois e SEM numeração contínua: elas têm
+        # a própria lista (/lembretes), e continuar a contagem faria
+        # /cancelar 7 mirar algo que nem está na agenda.
+        if soltos:
+            self._ultima_lista_flut[remetente] = soltos
+            saida += "\n\n🔔 *Sem hora marcada*\n" + "\n".join(
+                f"{i}. {c.titulo}" for i, c in enumerate(soltos, 1)
+            )
+        return saida
 
     def _hoje(self, remetente: str) -> str:
         agora = self._agora()
@@ -157,6 +225,33 @@ class Roteador:
 
     # -------------------------------------------------------------- agendamento
 
+    def _conflitos(self, comp: Compromisso) -> list[tuple[Compromisso, datetime]]:
+        """Compromissos que ocupam tempo e colidem com a primeira ocorrência.
+
+        Só reunião e reserva entram: pagamento e lembrete não bloqueiam nada,
+        e avisar "sua conta de luz conflita com a academia" seria ruído.
+        """
+        if comp.eh_flutuante or not comp.ocupa_tempo:
+            return []
+
+        ini = comp.quando_dt
+        fim = ini + timedelta(minutes=comp.duracao_min or 0)
+        saida: list[tuple[Compromisso, datetime]] = []
+
+        for outro in self._agenda.todos():
+            if outro.eh_flutuante or not outro.ocupa_tempo or outro.id == comp.id:
+                continue
+            for oc in outro.ocorrencias(
+                ini - timedelta(days=1), fim + timedelta(days=1), maximo=4
+            ):
+                outro_fim = oc + timedelta(minutes=outro.duracao_min or 0)
+                # Sobreposição aberta nos extremos: terminar 10h e começar 10h
+                # não é conflito.
+                if oc < fim and ini < outro_fim:
+                    saida.append((outro, oc))
+                    break
+        return saida
+
     def _tentar_agendar(self, remetente: str, texto: str) -> str | None:
         try:
             comp, avisos = analisar(texto, agora=self._agora())
@@ -168,11 +263,52 @@ class Roteador:
         msg = f"Confirma?\n\n{comp.humano()}"
         for a in avisos:
             msg += f"\n⚠️ {a}"
-        if comp.tipo is Tipo.PAGAMENTO:
-            dias = [d for d in comp.avisos_dias if d > 0]
-            if dias:
-                msg += f"\n🔔 aviso {dias[0]} dia(s) antes e no dia"
+
+        for outro, quando in self._conflitos(comp):
+            msg += f"\n⚠️ choca com {outro.titulo} ({quando:%d/%m %H:%M})"
+
+        resumo = _resumo_avisos(comp)
+        if resumo:
+            msg += f"\n{resumo}"
         return msg + "\n\n(sim / não)"
+
+    # --------------------------------------------------------- flutuantes
+
+    def _lembretes(self, remetente: str) -> str:
+        pend = flutuantes(self._agenda)
+        if not pend:
+            return "Nenhuma pendência solta. 🎉"
+        self._ultima_lista_flut[remetente] = pend
+        linhas = [f"{i}. {c.titulo}" for i, c in enumerate(pend, 1)]
+        return (
+            "🔔 *Sem hora marcada*\n" + "\n".join(linhas)
+            + "\n\n/feito N para riscar."
+        )
+
+    def _feito(self, remetente: str, arg: str) -> str:
+        arg = arg.strip()
+        pend = flutuantes(self._agenda)
+        if not pend:
+            return "Não há pendências soltas."
+
+        if not arg:
+            # Sem número: rende a última que foi cutucada. É a leitura certa
+            # para quem responde direto à notificação — que é justamente
+            # onde `/feito` sem argumento é oferecido.
+            alvo = max(pend, key=lambda c: c.ultima_cutucada or "")
+        else:
+            lista = self._ultima_lista_flut.get(remetente) or pend
+            try:
+                idx = int(arg)
+            except ValueError:
+                return "Use /feito N, com N da lista de /lembretes."
+            if not 1 <= idx <= len(lista):
+                return f"Não existe item {idx}. Veja /lembretes."
+            alvo = lista[idx - 1]
+
+        alvo.feito = True
+        self._agenda.atualizar(alvo)
+        return f"✅ Feito: {alvo.titulo}"
 
     # ------------------------------------------------------------------ público
 
@@ -223,6 +359,7 @@ class Roteador:
         if baixo == "/status":
             backend = type(self._agenda).__name__
             nome = {"AgendaGoogle": "Google Calendar",
+                    "AgendaHibrida": "Google Calendar + soltos em disco",
                     "AgendaLocal": "local (JSON)"}.get(backend, backend)
             try:
                 n = str(len(self._agenda.todos()))
@@ -244,6 +381,12 @@ class Roteador:
 
         if baixo in ("/contas", "/pagamentos"):
             return self._contas(remetente)
+
+        if baixo in ("/lembretes", "/pendencias", "/pendências"):
+            return self._lembretes(remetente)
+
+        if baixo.startswith("/feito"):
+            return self._feito(remetente, cmd[len("/feito"):])
 
         if baixo.startswith("/cancelar"):
             return self._cancelar(remetente, cmd[len("/cancelar"):])

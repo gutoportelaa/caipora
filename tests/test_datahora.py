@@ -44,6 +44,22 @@ CASOS = [
     ("aniversario dia 3 as 20h", "2026-08-03", "20:00", 60, "Aniversario"),
     ("yoga terca 7h da manha, meia hora", "2026-08-04", "07:00", 30, "Yoga"),
     ("jantar sabado 8 da noite", "2026-08-01", "20:00", 60, "Jantar"),
+    # ----------------------------------------------------------- meses por nome
+    # Antes destes casos, "dia 15 de marco" caía no ramo genérico "dia 15" e
+    # virava 15 do mês corrente — data errada e sem aviso nenhum.
+    ("consulta dia 15 de marco as 9h", "2027-03-15", "09:00", 60, "Consulta"),
+    ("aniversario da Maria 5 de setembro", "2026-09-05", "09:00", 60,
+     "Aniversario da Maria"),
+    ("viagem 20 de dezembro de 2027 as 6h", "2027-12-20", "06:00", 60, "Viagem"),
+    ("prova 3 de ago 14h", "2026-08-03", "14:00", 60, "Prova"),
+    # -------------------------------------------------------------- faixa horária
+    # A forma natural de descrever horário reservado. Dá início E duração.
+    ("academia amanha das 7h as 8h", "2026-07-30", "07:00", 60, "Academia"),
+    ("reuniao sexta das 14h as 16h30", "2026-07-31", "14:00", 150, "Reuniao"),
+    ("aula segunda de 19h30 as 22h", "2026-08-03", "19:30", 150, "Aula"),
+    # ------------------------------------------------------------- hora falada
+    ("correr amanha 8 e meia da manha", "2026-07-30", "08:30", 60, "Correr"),
+    ("call quinta 14 e 45", "2026-07-30", "14:45", 60, "Call"),
 ]
 
 

@@ -6,11 +6,11 @@
 refresh de token, criação com recorrência, releitura reconstruindo o domínio
 completo e remoção.
 
-- Extração determinística de data/hora/duração/valor/recorrência (`src/datahora.py`, `src/analise.py`)
-- Três tipos de compromisso com semânticas próprias (`src/dominio.py`)
+- Extração determinística de data/hora/faixa/duração/valor/recorrência (`src/datahora.py`, `src/analise.py`)
+- Quatro tipos de compromisso com semânticas próprias (`src/dominio.py`)
 - Backend Google (`AgendaGoogle`) com queda automática para local
-- Avisos proativos (`src/vigia.py`)
-- Comandos `/agenda`, `/hoje`, `/contas`, `/cancelar N`, e frase natural
+- Avisos proativos com escalada em minutos (`src/vigia.py`)
+- Comandos `/agenda`, `/hoje`, `/contas`, `/lembretes`, `/feito N`, `/cancelar N`, e frase natural
 
 ### Qual backend está ativo
 
@@ -253,7 +253,10 @@ Decisões deliberadas:
   bagunçada que caso de teste.
 - **Recusar em vez de adivinhar.** Sem data nem hora identificável, o parser
   devolve `None`. "marca o dentista" não vira evento às 9h de hoje — vai para
-  a conversa.
+  a conversa. **Exceção deliberada:** se a frase traz verbo explícito de
+  lembrete ("me lembra de estudar cálculo"), ela vira uma pendência
+  *flutuante* em vez de ser recusada — ver §5. A exigência do verbo é o que
+  impede "qual a capital da França" de virar item na lista.
 - **Pendência em memória.** Se o processo cair, a confirmação se perde. É o
   comportamento certo: gravar evento com base em intenção de antes do reboot
   seria pior que pedir de novo.
@@ -265,7 +268,116 @@ Decisões deliberadas:
 
 ---
 
-## 5. Fuso horário
+## 5. As quatro modalidades e o formato dos avisos
+
+### Por que quatro tipos, e não um evento genérico
+
+Cada tipo tem regra de aviso, de recorrência e de conflito **diferente**.
+Enfiar os quatro no mesmo formato empurra essas regras para dentro do
+roteador, onde se misturam e ninguém acha.
+
+| Tipo | Ocupa tempo? | Avisos padrão |
+|---|---|---|
+| `REUNIAO` — compromisso marcado | sim | `D0@07:30`, `-30m`, `-15m`, `-10m`, `0` |
+| `RESERVA` — horário reservado | sim | `D0@07:30`, `-30m` |
+| `PAGAMENTO` — conta a pagar | não | `-2d`, `0` |
+| `LEMBRETE` | não | `0`, ou nenhum (flutuante) |
+
+A separação entre **reunião** e **reserva** é a que mais paga: uma academia de
+segunda a sexta com a escalada completa seriam 25 notificações por semana.
+Assistente que notifica demais é desligado — e desligado ele é pior que
+nenhum. Rotina recebe o resumo do dia e um toque; compromisso pontual recebe
+a escalada.
+
+A classificação é por palavra-chave, determinística e auditável
+(`dominio.classificar`). Nada de LLM: confundir pagamento com reunião muda a
+regra de aviso e a recorrência. **Reserva sem recorrência vira reunião** —
+"psicólogo amanhã 15h" é consulta pontual; "psicólogo toda quarta 15h" é
+rotina.
+
+### O formato dos avisos
+
+Avisos são **strings**, não números de dias. O formato anterior
+(`avisos_dias: list[int]`) tornava "30 minutos antes" literalmente
+inexprimível.
+
+```
+"-30m"  "-2h"  "-2d"     deslocamento antes da ocorrência
+"0"                      no instante da ocorrência
+"D0@07:30"               07:30 do dia da ocorrência
+"D-1@20:00"              20:00 da véspera
+```
+
+A âncora `D` não é açúcar sintático sobre o deslocamento: "avisar no começo do
+dia" vale igual para uma reunião às 9h e uma às 18h, e expressar isso como
+`-1h30` e `-10h30` seria acidental e frágil.
+
+No Google Calendar os avisos viajam em `extendedProperties` **exatamente como
+escritos** — a mesma string que o domínio interpreta, sem conversão nem perda
+—, e além disso viram `reminders.overrides` nativos, como redundância barata
+caso o aparelho esteja fora do ar.
+
+### Três regras do vigia que a escalada em minutos tornou obrigatórias
+
+Nenhuma delas importava quando o aviso mais fino era "1 dia antes".
+
+1. **Tolerância proporcional.** Entregar "faltam 10 minutos" com 25 minutos de
+   atraso é entregá-lo *depois* do compromisso começar — pior que não avisar,
+   porque mente. A tolerância de cada aviso é limitada pela própria
+   antecedência dele; avisos na hora e de dias antes mantêm os 30 minutos
+   cheios.
+
+2. **Nada retroativo no cadastro.** Agendar às 09:50 algo para as 10:00 não
+   pode disparar `-30m`, `-15m` e `-10m` de uma vez. O campo `criado_em`
+   descarta avisos cuja hora já tinha passado quando o compromisso nasceu.
+
+3. **Uma mensagem por ciclo.** 07:30 é o minuto em que o dia inteiro dispara
+   junto. Sem coalescência, o resumo matinal vira seis notificações seguidas.
+   Quando tudo que disparou é âncora, a mensagem se anuncia como *Seu dia*.
+
+O histórico de deduplicação também precisou crescer: com cinco avisos por
+ocorrência, as cinco chaves do formato antigo não cobriam nem **uma**
+ocorrência — a mais velha era esquecida e repetia no ciclo seguinte. Agora
+são 24 chaves, podadas por idade.
+
+### Lembrete flutuante
+
+"Lembrar de estudar cálculo" não pertence a um minuto do calendário; pertence
+a uma janela do dia. Um lembrete flutuante tem `quando` vazio, uma `janela`
+(padrão `09:00-21:00`) e um `feito`.
+
+O vigia o oferece dentro da janela, com no mínimo 3h entre cutucadas, no
+máximo 3 por dia, e **nunca** em cima de um compromisso marcado (folga de 15
+min para cada lado). Ele só some quando você responde `/feito`. Sem essas
+travas, um lembrete sem hora pode disparar a qualquer hora — que é a receita
+para o usuário desligar tudo.
+
+**Onde ficam guardados:** num arquivo local separado (`AgendaHibrida`), mesmo
+quando o backend é o Google. O Calendar não tem onde representar um item sem
+horário; as saídas seriam inventar um evento ao meio-dia — poluindo a agenda
+de verdade — ou criar um evento de dia inteiro que reapareceria para sempre.
+
+### Recorrência: dias múltiplos e intervalo
+
+`Freq.SEMANAL` carrega uma **lista** de dias (`dias_semana`), não um só:
+"toda terça e quinta" é UM compromisso com dois dias, não dois compromissos —
+cancelar deve derrubar a série inteira. O campo `ancora` ficou restrito ao dia
+do mês (`MENSAL`).
+
+`intervalo` multiplica a frequência: quinzenal é `SEMANAL` com `intervalo=2`,
+"a cada 3 meses" é `MENSAL` com `intervalo=3`. Uma linha no lugar de dois
+membros novos no enum, e vira `INTERVAL=n` na RRULE do Google.
+
+O intervalo é contado a partir da **semana de origem**. Sem essa âncora,
+"quinzenal" viraria "semanal" toda vez que a busca começasse numa semana par.
+
+> "a cada 15 dias" é tratado como quinzenal (semanal, intervalo 2), não como
+> 15 dias corridos: é assim que se fala em português, e preserva o dia da
+> semana — contado em dias corridos, a consulta de quarta cairia numa quinta.
+
+---
+
+## 6. Fuso horário
 
 `America/Sao_Paulo` via `zoneinfo`, com o pacote **`tzdata` do pip**.
 
@@ -284,15 +396,32 @@ garantida é troca boa.
 
 ---
 
-## 6. Testes
+## 7. Testes
 
 ```bash
-python tests/test_datahora.py    # 14 casos de extração — 14/14
-python tests/test_roteador.py    # fluxo de agendamento — todos OK
+for t in tests/*.py; do python3 "$t" || echo "FALHOU: $t"; done
 ```
 
-Ambos rodam no aparelho também (verificado), sem pytest — uma dependência a
+| Arquivo | O que protege |
+|---|---|
+| `test_datahora.py` | extração de data, hora, faixa, meses por nome |
+| `test_analise.py` | frase → `Compromisso`, incluindo tipo e dias da semana |
+| `test_recorrencia.py` | expansão de ocorrências, dia 31, multi-dia, quinzenal |
+| `test_avisos.py` | escalada em minutos, tolerância, coalescência, migração |
+| `test_flutuante.py` | pendências sem hora: ritmo, teto diário, `AgendaHibrida` |
+| `test_roteador.py` | fluxo de agendamento e a fronteira com o LLM |
+| `test_vigia.py` | deduplicação e tolerância de atraso |
+| `test_agenda_google.py` | ida e volta do domínio pelo `extendedProperties` |
+| `test_resiliencia.py` | falhas de rede, JSON corrompido, token expirado |
+
+Todos rodam no aparelho também (verificado), sem pytest — uma dependência a
 menos.
+
+O teste mais valioso da escalada é o minuto a minuto em `test_avisos.py`: ele
+roda o vigia em cada minuto de uma janela de horas e exige que o conjunto de
+minutos que produziram mensagem seja **exatamente** o esperado. Isso pega de
+uma vez erro de escalada, buraco de tolerância e falha de deduplicação — os
+três modos de falha que se disfarçam um do outro.
 
 O `test_datahora.py` fixa "agora" numa **quarta-feira, 29/07/2026 10:00**. Sem
 referência fixa, um teste de "sexta" passa hoje e falha na semana que vem.

@@ -71,6 +71,50 @@ def main() -> int:
     checa("semanal: seguinte", sem.proxima_ocorrencia(dt("2026-08-03 11:00")),
           "2026-08-10 10:00")
 
+    # ------------------------------------------------- semanal em varios dias
+    # "aula toda terça e quinta" é UM compromisso com dois dias, não dois
+    # compromissos — cancelar deve derrubar a série inteira.
+    aula = Compromisso.nova(
+        Tipo.RESERVA, "Ingles", dt("2026-07-30 19:30"),
+        freq=Freq.SEMANAL, dias_semana=[1, 3],
+    )
+    checa("multi-dia: quinta (a propria base)",
+          aula.proxima_ocorrencia(dt("2026-07-30 08:00")), "2026-07-30 19:30")
+    checa("multi-dia: pula para a terca seguinte",
+          aula.proxima_ocorrencia(dt("2026-07-30 20:00")), "2026-08-04 19:30")
+    checa("multi-dia: e da terca volta para a quinta",
+          aula.proxima_ocorrencia(dt("2026-08-04 20:00")), "2026-08-06 19:30")
+
+    academia = Compromisso.nova(
+        Tipo.RESERVA, "Academia", dt("2026-07-30 07:00"),
+        freq=Freq.SEMANAL, dias_semana=[0, 1, 2, 3, 4],
+    )
+    checa("dias uteis: sexta depois da quinta",
+          academia.proxima_ocorrencia(dt("2026-07-30 08:00")), "2026-07-31 07:00")
+    checa("dias uteis: sabado e domingo sao pulados",
+          academia.proxima_ocorrencia(dt("2026-07-31 08:00")), "2026-08-03 07:00")
+
+    # --------------------------------------------------------- quinzenal
+    # Contado a partir da semana de origem: sem essa âncora, "quinzenal"
+    # viraria "semanal" toda vez que a busca começasse numa semana par.
+    quinzenal = Compromisso.nova(
+        Tipo.RESERVA, "Psicologo", dt("2026-07-29 15:00"),
+        freq=Freq.SEMANAL, dias_semana=[2], intervalo=2,
+    )
+    checa("quinzenal: pula uma semana",
+          quinzenal.proxima_ocorrencia(dt("2026-07-29 16:00")), "2026-08-12 15:00")
+    checa("quinzenal: consulta no meio nao adianta a serie",
+          quinzenal.proxima_ocorrencia(dt("2026-08-05 12:00")), "2026-08-12 15:00")
+    checa("quinzenal: seguinte",
+          quinzenal.proxima_ocorrencia(dt("2026-08-12 16:00")), "2026-08-26 15:00")
+
+    trimestral = Compromisso.nova(
+        Tipo.LEMBRETE, "Revisao", dt("2026-07-10 09:00"),
+        freq=Freq.MENSAL, ancora=10, intervalo=3,
+    )
+    checa("a cada 3 meses", trimestral.proxima_ocorrencia(dt("2026-07-10 10:00")),
+          "2026-10-10 09:00")
+
     # ------------------------------------------------------------------ diaria
     dia = Compromisso.nova(
         Tipo.LEMBRETE, "Remedio", dt("2026-07-30 08:00"), freq=Freq.DIARIA

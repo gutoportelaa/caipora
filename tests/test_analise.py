@@ -32,8 +32,10 @@ CASOS = [
     ("fatura do cartao dia 10 de todo mes R$ 2.340,55",
      Tipo.PAGAMENTO, "2026-08-10 09:00", Freq.MENSAL, 10, 234055, "Fatura do cartao"),
     # --------------------------------------------------------------- reuniões
+    # Recorrência semanal guarda os dias em `dias_semana`, não em `ancora` —
+    # `ancora` ficou só para o dia do mês. Ver o bloco DIAS_SEMANA no fim.
     ("reuniao com o time toda segunda 10h",
-     Tipo.REUNIAO, "2026-08-03 10:00", Freq.SEMANAL, 0, None, "Reuniao com o time"),
+     Tipo.REUNIAO, "2026-08-03 10:00", Freq.SEMANAL, None, None, "Reuniao com o time"),
     ("call com cliente sexta 15h, 30 min",
      Tipo.REUNIAO, "2026-07-31 15:00", Freq.UNICA, None, None, "Call com cliente"),
     ("dentista amanha as 14h",
@@ -51,9 +53,46 @@ CASOS = [
      Tipo.LEMBRETE, "2026-07-29 20:00", Freq.UNICA, None, None, "Regar as plantas"),
     ("lembra de tomar remedio todo dia 8h",
      Tipo.LEMBRETE, "2026-07-30 08:00", Freq.DIARIA, None, None, "Tomar remedio"),
+    # "daqui 3 dias" sem o "a" — como se fala.
+    ("ligar pro Joao daqui 3 dias",
+     Tipo.LEMBRETE, "2026-08-01 10:00", Freq.UNICA, None, None, "Ligar pro Joao"),
+    # ------------------------------------------------------ horário reservado
+    # Rotina recorrente que ocupa uma faixa fixa: tipo próprio, com escalada
+    # de avisos mais discreta que a de reunião.
+    ("academia de segunda a sexta das 7h as 8h",
+     Tipo.RESERVA, "2026-07-30 07:00", Freq.SEMANAL, None, None, "Academia"),
+    ("aula de ingles toda terca e quinta 19h30",
+     Tipo.RESERVA, "2026-07-30 19:30", Freq.SEMANAL, None, None, "Aula de ingles"),
+    ("psicologo quinzenal quarta 15h",
+     Tipo.RESERVA, "2026-07-29 15:00", Freq.SEMANAL, None, None, "Psicologo"),
+    # Sem recorrência, "horário reservado" é na prática compromisso pontual —
+    # e recebe a escalada de reunião.
+    ("psicologo amanha 15h",
+     Tipo.REUNIAO, "2026-07-30 15:00", Freq.UNICA, None, None, "Psicologo"),
 ]
 
-RECUSAR = ["marca o dentista", "lembra de comprar pao", "oi tudo bem"]
+# Frases que não descrevem compromisso nenhum: seguem para o modelo local.
+# "marca o dentista" fica aqui porque é ordem de agendar SEM quando — e sem
+# verbo de lembrete não temos direito de transformá-la em pendência solta.
+RECUSAR = ["marca o dentista", "oi tudo bem", "qual a capital da Franca"]
+
+# Verbo explícito de lembrete e nenhum horário => pendência flutuante, não
+# recusa. É a modalidade "demanda adiável": vale, mas não tem hora.
+FLUTUANTES = [
+    ("lembra de comprar pao", "Comprar pao"),
+    ("me lembra de estudar calculo", "Estudar calculo"),
+    ("nao esquecer de mandar mensagem pra Ana", "Mandar mensagem pra Ana"),
+]
+
+# frase -> dias da semana esperados (0=segunda)
+DIAS_SEMANA = [
+    ("reuniao com o time toda segunda 10h", [0]),
+    ("aula de ingles toda terca e quinta 19h30", [1, 3]),
+    ("academia de segunda a sexta das 7h as 8h", [0, 1, 2, 3, 4]),
+    ("treino todas as segundas, quartas e sextas 18h", [0, 2, 4]),
+    ("estudar todo dia util as 8h", [0, 1, 2, 3, 4]),
+    ("feira todo fim de semana 9h", [5, 6]),
+]
 
 
 def main() -> int:
@@ -96,7 +135,33 @@ def main() -> int:
         except NaoEntendi:
             print(f"ok     {frase!r} -> recusado")
 
-    total = len(CASOS) + len(RECUSAR)
+    for frase, titulo_e in FLUTUANTES:
+        try:
+            c, _ = analisar(frase, agora=AGORA)
+        except NaoEntendi:
+            print(f"FALHA  {frase!r} deveria virar pendencia solta, foi recusada")
+            falhas += 1
+            continue
+        if not c.eh_flutuante or c.titulo != titulo_e:
+            print(f"FALHA  {frase!r} -> flutuante={c.eh_flutuante} titulo={c.titulo!r}")
+            falhas += 1
+        else:
+            print(f"ok     {frase!r} -> {c.humano()}")
+
+    for frase, dias_e in DIAS_SEMANA:
+        try:
+            c, _ = analisar(frase, agora=AGORA)
+        except NaoEntendi:
+            print(f"FALHA  {frase!r} recusada, esperava recorrencia semanal")
+            falhas += 1
+            continue
+        if sorted(c.dias_semana) != dias_e:
+            print(f"FALHA  {frase!r} dias {sorted(c.dias_semana)} != {dias_e}")
+            falhas += 1
+        else:
+            print(f"ok     {frase!r} -> {c._freq_fmt()}")
+
+    total = len(CASOS) + len(RECUSAR) + len(FLUTUANTES) + len(DIAS_SEMANA)
     print(f"\n{total - falhas}/{total} passaram")
     return 1 if falhas else 0
 

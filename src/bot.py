@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from calendario import AgendaLocal
+from calendario import AgendaHibrida, AgendaLocal
 from canal_telegram import CanalTelegram, ErroPermanente
 from llm import LLM
 from roteador import Roteador
@@ -56,7 +56,13 @@ def _escolher_agenda(raiz: Path):
     está fora ficam só no arquivo local e não aparecem no Google depois. Por
     isso `/status` mostra sempre qual backend está ativo — divergência
     silenciosa seria pior que o erro.
+
+    Em qualquer cenário os lembretes SEM hora marcada ficam num arquivo à
+    parte: não são eventos de calendário e não têm onde morar no Google.
+    Ver `AgendaHibrida`.
     """
+    soltos = AgendaLocal(raiz / "dados" / "lembretes.json")
+
     token = raiz / "token.json"
     if token.exists():
         try:
@@ -64,8 +70,8 @@ def _escolher_agenda(raiz: Path):
 
             ag = AgendaGoogle(token)
             ag.todos()  # falha rápido: valida credencial e rede agora
-            log.info("agenda: Google Calendar")
-            return ag
+            log.info("agenda: Google Calendar (+ lembretes soltos em disco)")
+            return AgendaHibrida(ag, soltos)
         except Exception as e:
             log.error("Google Calendar indisponivel (%s) — caindo para agenda local", e)
             log.error("reautorize com: python scripts/autorizar_google.py")
