@@ -55,3 +55,8 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# === Artefatos do WSL/Windows ===
+# O Explorer marca arquivos baixados com um stream alternativo que aparece
+# como arquivo separado no Linux. Nunca deve ser versionado.
+*:Zone.Identifier
